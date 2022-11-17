@@ -1,10 +1,14 @@
 #!/bin/bash
 set -e
 
-# setup ros2 environment
-source /opt/ros/$ROS_DISTRO/setup.bash
+if [[ -v FASTRTPS_DEFAULT_PROFILES_FILE ]]; then
+    auxfile="/dds-config-aux.xml"
+    cp --attributes-only --preserve $FASTRTPS_DEFAULT_PROFILES_FILE $auxfile
+    cat $FASTRTPS_DEFAULT_PROFILES_FILE | envsubst > $auxfile
+    export FASTRTPS_DEFAULT_PROFILES_FILE=$auxfile
+fi
 
-# setup Fast DDS RMW
-source /fastdds_overlay/install/setup.bash
+# setup ros environment
+source "/opt/ros/$ROS_DISTRO/setup.bash"
 
 exec "$@"
