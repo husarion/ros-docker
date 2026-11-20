@@ -1,73 +1,66 @@
-# husarion/ros: the official ROS 2 images plus what every Husarion ROS image
-# shares (README.md). Two targets, two tag families:
-#   ros-core  FROM the official ros:<distro>-ros-core, pinned by digest
-#   ros-base  FROM our ros-core, plus exactly what the official ros-base adds
-# Every value comes from distros.env through scripts/build-args.sh; a build
-# without them fails on purpose (the ARGs below have no defaults).
+# husarion/ros: the official ROS 2 images plus what every Husarion ROS image shares.
+# All values come from distros.env (see the justfile).
 
 ARG ROS_CORE_IMAGE
-# The image the ros-base target is built FROM: the ros-core stage of the same
-# build by default. CI passes the ros-core digest it has just pushed, so the
-# ros-base layers sit on exactly the bytes published as ros-core.
-ARG ROS_CORE_REF=ros-core
-
 FROM ${ROS_CORE_IMAGE} AS ros-core
-# The distro distros.env meant; the script checks it is the image's ROS_DISTRO.
-ARG DISTRO
+
 ARG CODENAME
 ARG ROS_SNAPSHOT
 ARG UBUNTU_SNAPSHOT
-ARG ROS_SNAPSHOT_KEY_FPR
-ARG FASTDDS_RELEASE
 ARG FASTDDS_PKG
-ARG FASTDDS_UPSTREAM
-ARG FASTDDS_SUFFIX
+ARG FASTDDS_RELEASE
 ARG FASTDDS_SHA256_amd64
 ARG FASTDDS_SHA256_arm64
-# A local file instead of the release download (a fastdds-patched build not
-# released yet); its sha256 must still match the pin. Path in the build context.
-ARG FASTDDS_DEB_LOCAL=
 ARG TARGETARCH
 
-# All of our additions in one layer, in this order (scripts/setup-ros-core.sh):
-# snapshot sources, the patched Fast DDS held and pinned, one apt-get upgrade,
-# the three RMWs, apt retries, husarion-base-check, the entrypoint.
-RUN --mount=type=bind,target=/src \
-    DISTRO="${DISTRO}" CODENAME="${CODENAME}" \
-    ROS_SNAPSHOT="${ROS_SNAPSHOT}" UBUNTU_SNAPSHOT="${UBUNTU_SNAPSHOT}" \
-    ROS_SNAPSHOT_KEY_FPR="${ROS_SNAPSHOT_KEY_FPR}" \
-    FASTDDS_RELEASE="${FASTDDS_RELEASE}" FASTDDS_PKG="${FASTDDS_PKG}" \
-    FASTDDS_UPSTREAM="${FASTDDS_UPSTREAM}" FASTDDS_SUFFIX="${FASTDDS_SUFFIX}" \
-    FASTDDS_SHA256_amd64="${FASTDDS_SHA256_amd64}" FASTDDS_SHA256_arm64="${FASTDDS_SHA256_arm64}" \
-    FASTDDS_DEB_LOCAL="${FASTDDS_DEB_LOCAL}" TARGETARCH="${TARGETARCH}" \
-    bash /src/scripts/setup-ros-core.sh
+COPY keys/ros-snapshots.asc /usr/share/keyrings/ros-snapshots.asc
 
-ENTRYPOINT ["/ros_entrypoint.sh"]
-CMD ["bash"]
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-ARG ROS_CORE_NAME
-ARG ROS_CORE_DIGEST
-ARG REVISION=unknown
-ARG FASTDDS_UPSTREAM
-ARG FASTDDS_SUFFIX
-LABEL org.opencontainers.image.title="husarion/ros ${ROS_DISTRO} ros-core" \
-      org.opencontainers.image.source="https://github.com/husarion/ros-docker" \
-      org.opencontainers.image.revision="${REVISION}" \
-      org.opencontainers.image.base.name="${ROS_CORE_NAME}" \
-      org.opencontainers.image.base.digest="${ROS_CORE_DIGEST}" \
-      com.husarion.ros.distro="${ROS_DISTRO}" \
-      com.husarion.ros.fastdds="${FASTDDS_UPSTREAM}${FASTDDS_SUFFIX}" \
-      com.husarion.ros.fastdds-release="husarion/fastdds-patched ${FASTDDS_RELEASE}" \
-      com.husarion.ros.snapshot.ros="${ROS_SNAPSHOT}" \
-      com.husarion.ros.snapshot.ubuntu="${UBUNTU_SNAPSHOT}"
+# 1. apt reads ROS and Ubuntu as they were on the snapshot dates, so images built
+#    on this base later install the same package versions it carries.
+# 2. The patched Fast DDS from husarion/fastdds-patched, checked and held.
+# 3. One upgrade, then the three RMWs.
+RUN set -eux; \
+    apt-get purge -y ros2-apt-source 2>/dev/null || true; \
+    rm -f /etc/apt/sources.list.d/*; \
+    : > /etc/apt/sources.list; \
+    printf '%s\n' \
+      "Types: deb" \
+      "URIs: http://snapshots.ros.org/${ROS_DISTRO}/${ROS_SNAPSHOT}/ubuntu" \
+      "Suites: ${CODENAME}" \
+      "Components: main" \
+      "Signed-By: /usr/share/keyrings/ros-snapshots.asc" \
+      "" \
+      "Types: deb" \
+      "URIs: https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}" \
+      "Suites: ${CODENAME} ${CODENAME}-updates ${CODENAME}-security" \
+      "Components: main universe restricted multiverse" \
+      "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg" \
+      > /etc/apt/sources.list.d/snapshot.sources; \
+    printf 'Acquire::Retries "8";\n' > /etc/apt/apt.conf.d/80-retries; \
+    pkg="ros-${ROS_DISTRO}-${FASTDDS_PKG}"; \
+    sha="FASTDDS_SHA256_${TARGETARCH}"; \
+    curl -fsSL --retry 5 -o /tmp/fastdds.deb \
+      "https://github.com/husarion/fastdds-patched/releases/download/${FASTDDS_RELEASE}/${FASTDDS_PKG}-${ROS_DISTRO}-${TARGETARCH}.deb"; \
+    echo "${!sha}  /tmp/fastdds.deb" | sha256sum -c -; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends --allow-downgrades /tmp/fastdds.deb; \
+    apt-mark hold "$pkg"; \
+    apt-get upgrade -y; \
+    apt-get install -y --no-install-recommends \
+      "ros-${ROS_DISTRO}-rmw-cyclonedds-cpp" \
+      "ros-${ROS_DISTRO}-rmw-fastrtps-cpp" \
+      "ros-${ROS_DISTRO}-rmw-zenoh-cpp"; \
+    rm -rf /var/lib/apt/lists/* /tmp/fastdds.deb
 
+LABEL org.opencontainers.image.source="https://github.com/husarion/ros-docker" \
+      org.opencontainers.image.base.name="${ROS_CORE_IMAGE}"
 
-FROM ${ROS_CORE_REF} AS ros-base
-ARG ROS_BASE_VERSION
-# The official ros-base recipe (osrf/docker_images ros/<distro>/ubuntu/<codename>/
-# ros-base/Dockerfile), step for step: the bootstrap tools, rosdep, colcon
-# mixin and metadata, then ros-<distro>-ros-base. Only the apt-get update lines
-# differ: they resolve against the snapshot the ros-core layer pinned.
+# ros-base: our ros-core plus exactly what the official ros-base adds
+# (osrf/docker_images ros/<distro>/.../ros-base/Dockerfile).
+FROM ros-core AS ros-base
+
 RUN apt-get update && apt-get install --no-install-recommends -y \
     build-essential \
     git \
@@ -88,10 +81,5 @@ RUN colcon mixin add default \
     colcon metadata update
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ros-${ROS_DISTRO}-ros-base=${ROS_BASE_VERSION} \
+    ros-${ROS_DISTRO}-ros-base \
     && rm -rf /var/lib/apt/lists/*
-
-# What every child does as its last RUN.
-RUN husarion-base-check
-
-LABEL org.opencontainers.image.title="husarion/ros ${ROS_DISTRO} ros-base"
