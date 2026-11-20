@@ -1,0 +1,238 @@
+name: release
+
+# Triggered by the tag `just release <distro>` pushes: <distro>-YYYYMMDD[.N].
+# Stage, then promote (SPEC-SHARED-ROS-BASE §10.5):
+#   1. build: each architecture on its native runner builds ros-core, then
+#      ros-base FROM the ros-core digest it has just pushed, and pushes both BY
+#      DIGEST ONLY (no tag) to husarion/ros; then runs test/ against exactly
+#      those digests.
+#   2. promote: only when both architectures are green, `imagetools create`
+#      stitches the digests into the dated tags (<distro>-ros-core-<version>,
+#      <distro>-ros-base-<version>) and moves the undated ones, and the GitHub
+#      release of the tag gets the CHANGELOG section and both index digests.
+# Anything red tags nothing; untagged digests are left for Hub's cleanup.
+#
+# Docker Hub auth, the Husarion two-token pattern (ros2_airlock
+# docs/ci-dockerhub-two-token-release.md):
+#   DOCKERHUB_USERNAME + DOCKERHUB_TOKEN  read-only public token: pulls the
+#                                         official ros images only
+#   DOCKERHUB_OAT (username husarion)     org access token: pushes husarion/ros
+# The read-only login pulls the pinned official images first and mirrors
+# ros-core into a job-local registry, so the OAT-authenticated build never
+# asks docker.io for library/ros.
+
+on:
+  push:
+    tags:
+      - "jazzy-*"
+      - "humble-*"
+      - "lyrical-*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: docker.io/husarion/ros
+
+jobs:
+  meta:
+    runs-on: ubuntu-24.04
+    outputs:
+      distro: ${{ steps.parse.outputs.distro }}
+      version: ${{ steps.parse.outputs.version }}
+    steps:
+      - name: Parse the tag
+        id: parse
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^(jazzy|humble|lyrical)-([0-9]{8}(\.[0-9]+)?)$ ]] \
+            || { echo "tag $TAG is not <distro>-YYYYMMDD[.N]" >&2; exit 1; }
+          echo "distro=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          echo "version=${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
+
+      - name: The dated tags are free on Docker Hub
+        env:
+          DISTRO: ${{ steps.parse.outputs.distro }}
+          VERSION: ${{ steps.parse.outputs.version }}
+        run: |
+          set -euo pipefail
+          for fam in ros-core ros-base; do
+            t="${DISTRO}-${fam}-${VERSION}"
+            code=$(curl -s -o /dev/null -w '%{http_code}' --retry 3 \
+              "https://hub.docker.com/v2/namespaces/husarion/repositories/ros/tags/$t")
+            [ "$code" = 404 ] || { echo "husarion/ros:$t: Hub answered $code (a dated tag is never pushed twice)" >&2; exit 1; }
+          done
+
+  build:
+    needs: meta
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      DISTRO: ${{ needs.meta.outputs.distro }}
+      PLATFORM: linux/${{ matrix.arch }}
+    services:
+      registry:
+        image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373  # registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+        with:
+          driver-opts: network=host
+
+      - name: Docker Hub login (read-only, public pulls)
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # By the digests distros.env pins: the pull refuses any other bytes. The
+      # official ros-base is only for test/ (its package set and layers).
+      - name: Pull the pinned official images, mirror ros-core
+        run: |
+          set -euo pipefail
+          core=$(scripts/build-args.sh "$DISTRO" get ROS_CORE)
+          base=$(scripts/build-args.sh "$DISTRO" get ROS_BASE_OFFICIAL)
+          docker pull -q --platform "$PLATFORM" "$core"
+          docker pull -q --platform "$PLATFORM" "$base"
+          docker tag "$core" "localhost:5000/ros-core-official:${DISTRO}"
+          docker push -q "localhost:5000/ros-core-official:${DISTRO}"
+
+      - name: Docker Hub login (OAT, husarion/ros push)
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
+        with:
+          username: husarion
+          password: ${{ secrets.DOCKERHUB_OAT }}
+
+      - name: Build and push ros-core, then ros-base on it, by digest
+        id: build
+        run: |
+          set -euo pipefail
+          export ROS_CORE_IMAGE_OVERRIDE="localhost:5000/ros-core-official:${DISTRO}"
+          mapfile -t args < <(scripts/build-args.sh "$DISTRO")
+          out="type=image,name=${IMAGE},push-by-digest=true,name-canonical=true,push=true"
+          docker buildx build --platform "$PLATFORM" "${args[@]}" --no-cache \
+            --provenance=false --sbom=false --target ros-core \
+            --output "$out" --metadata-file /tmp/core.json .
+          core=$(jq -r '."containerimage.digest"' /tmp/core.json)
+          docker buildx build --platform "$PLATFORM" "${args[@]}" \
+            --build-arg "ROS_CORE_REF=${IMAGE}@${core}" \
+            --provenance=false --sbom=false --target ros-base \
+            --output "$out" --metadata-file /tmp/base.json .
+          base=$(jq -r '."containerimage.digest"' /tmp/base.json)
+          echo "core=$core" >> "$GITHUB_OUTPUT"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "ros-core ${{ matrix.arch }}: $core, ros-base ${{ matrix.arch }}: $base"
+
+      # The pushed bytes, natively on this architecture. The children test/
+      # builds use the docker driver (local images); nothing is pushed by it.
+      - name: test/ on the pushed digests
+        env:
+          TEST_BUILDER: default
+          TEST_MEMORY: 6g
+        run: |
+          set -euo pipefail
+          test/run.sh "$DISTRO" "${IMAGE}@${{ steps.build.outputs.core }}" "${IMAGE}@${{ steps.build.outputs.base }}"
+
+      - name: Export the digests
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          echo "${{ steps.build.outputs.core }}" > "/tmp/digests/ros-core-${{ matrix.arch }}"
+          echo "${{ steps.build.outputs.base }}" > "/tmp/digests/ros-base-${{ matrix.arch }}"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 7
+
+  promote:
+    needs: [meta, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      DISTRO: ${{ needs.meta.outputs.distro }}
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          pattern: digests-*
+          merge-multiple: true
+          path: /tmp/digests
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+
+      - name: Docker Hub login (OAT)
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
+        with:
+          username: husarion
+          password: ${{ secrets.DOCKERHUB_OAT }}
+
+      - name: Tag the tested digests (dated, then undated)
+        run: |
+          set -euo pipefail
+          : > /tmp/indexes
+          for fam in ros-core ros-base; do
+            amd=$(cat "/tmp/digests/${fam}-amd64"); arm=$(cat "/tmp/digests/${fam}-arm64")
+            dated="${IMAGE}:${DISTRO}-${fam}-${VERSION}"
+            code=$(curl -s -o /dev/null -w '%{http_code}' --retry 3 \
+              "https://hub.docker.com/v2/namespaces/husarion/repositories/ros/tags/${DISTRO}-${fam}-${VERSION}")
+            [ "$code" = 404 ] || { echo "${dated}: Hub answered $code, refusing to push a dated tag twice" >&2; exit 1; }
+            docker buildx imagetools create -t "$dated" -t "${IMAGE}:${DISTRO}-${fam}" \
+              "${IMAGE}@${amd}" "${IMAGE}@${arm}"
+            raw=$(docker buildx imagetools inspect --raw "$dated")
+            idx=$(docker buildx imagetools inspect "$dated" --format '{{json .Manifest}}' | jq -r .digest)
+            # The index lists exactly the two tested digests.
+            got=$(jq -r '[.manifests[].digest] | sort | join(" ")' <<< "$raw")
+            want=$(printf '%s\n' "$amd" "$arm" | sort | paste -sd' ')
+            [ "$got" = "$want" ] || { echo "${dated} lists [$got], tested [$want]" >&2; exit 1; }
+            echo "${fam} ${idx} ${amd} ${arm}" >> /tmp/indexes
+          done
+          cat /tmp/indexes
+
+      - name: GitHub release with the index digests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          {
+            awk -v h="## ${TAG} " 'index($0, h) == 1 {on = 1; next} on && /^## / {exit} on' CHANGELOG.md
+            echo
+            echo "| Image | Index digest |"
+            echo "| -- | -- |"
+            while read -r fam idx amd arm; do
+              echo "| \`husarion/ros:${DISTRO}-${fam}-${VERSION}\` | \`${idx}\` |"
+            done < /tmp/indexes
+            echo
+            echo "Pin with \`husarion/ros:${DISTRO}-ros-<core|base>-${VERSION}@<index digest>\`."
+            echo
+            echo "Per-architecture manifests:"
+            echo
+            while read -r fam idx amd arm; do
+              echo "- ${fam}: amd64 \`${amd}\`, arm64 \`${arm}\`"
+            done < /tmp/indexes
+          } > /tmp/notes.md
+          cat /tmp/notes.md
+          gh release create "$TAG" --title "husarion/ros ${TAG}" --notes-file /tmp/notes.md --verify-tag
