@@ -35,9 +35,14 @@ printf '%-44s %12s %14s\n' "image ($platform)" "compressed" "uncompressed"
 for fam in core base; do
     off=$(get "ROS_$( [ $fam = core ] && echo CORE || echo BASE_OFFICIAL)")
     # One platform per local reference: make sure the local copy is $arch.
-    [ "$(docker image inspect -f '{{.Architecture}}' "$off" 2>/dev/null)" = "$arch" ] \
-        || docker pull -q --platform "$platform" "$off" >/dev/null
+    # (docker refuses a second platform under one digest: pull the platform manifest.)
+    offl=$off
+    if [ "$(docker image inspect -f '{{.Architecture}}' "$off" 2>/dev/null)" != "$arch" ]; then
+        m=$(docker buildx imagetools inspect --raw "$off" | jq -r --arg a "$arch" '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $a) | .digest' | head -1)
+        offl="${off%%@*}@${m}"
+        docker pull -q "$offl" >/dev/null
+    fi
     ours="husarion/ros:${distro}-ros-${fam}-local${suffix}"
-    printf '%-44s %9s MB %11s MB\n' "official ros:${distro}-ros-${fam}" "$(mb "$(official_compressed "$off")")" "$(mb "$(uncompressed "$off")")"
+    printf '%-44s %9s MB %11s MB\n' "official ros:${distro}-ros-${fam}" "$(mb "$(official_compressed "$off")")" "$(mb "$(uncompressed "$offl")")"
     printf '%-44s %9s MB %11s MB\n' "husarion/ros:${distro}-ros-${fam}" "$(mb "$(local_compressed "$ours")")" "$(mb "$(uncompressed "$ours")")"
 done
