@@ -22,7 +22,7 @@ accept='application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distri
 local_compressed() { # local image -> sum of compressed layer sizes, and the per-layer list
     local t="$reg/sizes/${1##*:}"
     docker tag "$1" "$t" && docker push -q "$t" >/dev/null
-    curl -s -H "Accept: $accept" "http://$reg/v2/sizes/${1##*:}/manifests/${1##*:}" | jq '[.layers[].size] | add'
+    curl -s -H "Accept: $accept" "http://$reg/v2/sizes/${1##*:}/manifests/latest" | jq '[.layers[].size] | add'
 }
 official_compressed() { # official index ref -> compressed size of its $arch manifest
     docker buildx imagetools inspect --raw "$1" \
