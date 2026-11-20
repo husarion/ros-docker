@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # husarion/ros: the official ROS 2 images plus what every Husarion ROS image
 # shares (README.md). Two targets, two tag families:
 #   ros-core  FROM the official ros:<distro>-ros-core, pinned by digest
