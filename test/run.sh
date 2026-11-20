@@ -37,7 +37,6 @@ else
     iso=(-e ROS_DOMAIN_ID=88 -e ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST)
 fi
 tag_sfx="$distro-$arch-$$"
-children=()
 
 pass=0; failn=0; results=()
 ok()   { pass=$((pass + 1)); results+=("PASS $1"); echo "PASS $1"; }
@@ -49,9 +48,16 @@ in_img() { local img=$1 net=$2; shift 2; docker run --rm -i --platform "$PLATFOR
 child() { # child <name> <dockerfile on stdin>: build a throwaway child, print its tag
     local t="husarion-ros-test/${1}:${tag_sfx}"
     if docker buildx build --builder "$builder" --platform "$PLATFORM" --provenance=false \
-        --load -q -t "$t" - >/dev/null; then children+=("$t"); echo "$t"; else return 1; fi
+        --load -q -t "$t" - >/dev/null; then echo "$t"; else return 1; fi
 }
-cleanup() { [ "${KEEP_CHILDREN:-0}" = 1 ] || [ ${#children[@]} = 0 ] || docker rmi -f "${children[@]}" >/dev/null 2>&1; }
+# The children are listed by this run's own tag (child runs in a subshell, so
+# it cannot record them itself): exact references, nothing else.
+cleanup() {
+    [ "${KEEP_CHILDREN:-0}" = 1 ] && return 0
+    local c
+    for c in app swap; do docker rmi "husarion-ros-test/${c}:${tag_sfx}" >/dev/null 2>&1; done
+    return 0
+}
 trap cleanup EXIT
 
 echo "== husarion/ros $distro on $PLATFORM: core=$core base=$base"
