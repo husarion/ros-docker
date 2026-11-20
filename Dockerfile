@@ -12,6 +12,8 @@ ARG FASTDDS_RELEASE
 ARG FASTDDS_SHA256_amd64
 ARG FASTDDS_SHA256_arm64
 ARG TARGETARCH
+# Declared before FROM it is not in scope here; redeclared for the label below.
+ARG ROS_CORE_IMAGE
 
 COPY keys/ros-snapshots.asc /usr/share/keyrings/ros-snapshots.asc
 
