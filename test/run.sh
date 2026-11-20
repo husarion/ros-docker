@@ -55,9 +55,17 @@ cleanup() { [ "${KEEP_CHILDREN:-0}" = 1 ] || [ ${#children[@]} = 0 ] || docker r
 trap cleanup EXIT
 
 echo "== husarion/ros $distro on $PLATFORM: core=$core base=$base"
-for img in "$core" "$base"; do
-    docker image inspect "$img" >/dev/null 2>&1 || docker pull -q --platform "$PLATFORM" "$img" >/dev/null || { echo "cannot get $img" >&2; exit 2; }
-done
+# The local image store keeps one platform per reference: use a local copy
+# only when it is of the architecture under test, else pull that platform.
+ensure() {
+    local a
+    a=$(docker image inspect -f '{{.Architecture}}' "$1" 2>/dev/null || true)
+    [ "$a" = "$arch" ] && return 0
+    docker pull -q --platform "$PLATFORM" "$1" >/dev/null || { echo "cannot get $1 for $PLATFORM" >&2; exit 2; }
+    a=$(docker image inspect -f '{{.Architecture}}' "$1")
+    [ "$a" = "$arch" ] || { echo "$1 is $a, not $arch" >&2; exit 2; }
+}
+for img in "$core" "$base"; do ensure "$img"; done
 
 # --- T1/T2/T9: the contents, on both families --------------------------------
 for fam in core base; do
@@ -108,9 +116,7 @@ esac
 
 # --- T7: ros-base's tool set is the official ros-base's -----------------------
 pkgs() { docker run --rm --platform "$PLATFORM" --network none --entrypoint dpkg-query "$1" -W -f '${Package}\n' | sort -u; }
-for o in "$official_core" "$official_base"; do
-    docker image inspect "$o" >/dev/null 2>&1 || docker pull -q --platform "$PLATFORM" "$o" >/dev/null
-done
+ensure "$official_core"; ensure "$official_base"
 tmp=$(mktemp -d); trap 'cleanup; rm -rf "$tmp"' EXIT
 ocl=$(docker image inspect -f '{{join .RootFS.Layers " "}}' "$official_core")
 obl=$(docker image inspect -f '{{join .RootFS.Layers " "}}' "$official_base")

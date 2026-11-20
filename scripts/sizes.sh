@@ -34,7 +34,9 @@ uncompressed() { docker image inspect -f '{{.Size}}' "$1"; }
 printf '%-44s %12s %14s\n' "image ($platform)" "compressed" "uncompressed"
 for fam in core base; do
     off=$(get "ROS_$( [ $fam = core ] && echo CORE || echo BASE_OFFICIAL)")
-    docker image inspect "$off" >/dev/null 2>&1 || docker pull -q --platform "$platform" "$off" >/dev/null
+    # One platform per local reference: make sure the local copy is $arch.
+    [ "$(docker image inspect -f '{{.Architecture}}' "$off" 2>/dev/null)" = "$arch" ] \
+        || docker pull -q --platform "$platform" "$off" >/dev/null
     ours="husarion/ros:${distro}-ros-${fam}-local${suffix}"
     printf '%-44s %9s MB %11s MB\n' "official ros:${distro}-ros-${fam}" "$(mb "$(official_compressed "$off")")" "$(mb "$(uncompressed "$off")")"
     printf '%-44s %9s MB %11s MB\n' "husarion/ros:${distro}-ros-${fam}" "$(mb "$(local_compressed "$ours")")" "$(mb "$(uncompressed "$ours")")"
